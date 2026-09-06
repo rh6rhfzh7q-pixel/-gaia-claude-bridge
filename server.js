@@ -26,7 +26,37 @@ function createServer() {
       ]
     })
   );
+  server.registerTool(
+    "gaia_memory_status",
+    {
+      description: "Check whether the GAIA persistent memory database is connected."
+    },
+    async () => {
+      try {
+        const response = await fetch(process.env.DATABASE_URL, {
+          method: "GET"
+        });
 
+        return {
+          content: [
+            {
+              type: "text",
+              text: `GAIA Memory configured. Database endpoint responded with HTTP ${response.status}.`
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `GAIA Memory configuration detected, but connection test failed: ${error.message}`
+            }
+          ]
+        };
+      }
+    }
+  );
   return server;
 }
 
