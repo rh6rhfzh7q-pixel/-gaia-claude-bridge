@@ -1,5 +1,5 @@
 import express from "express";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import pg from "pg";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -150,6 +150,29 @@ function createServer() {
   }));
   return server;
 }
+
+
+// Require a private bearer token for every MCP request. Fail closed when unset.
+// /health remains public but exposes only service status, never memory content.
+function authorizeMcp(req, res, next) {
+  const token = process.env.GAIA_MCP_TOKEN;
+  if (!token || token.length < 32) {
+    res.status(503).json({ error: "MCP access not configured" });
+    return;
+  }
+  const authorization = req.get("authorization") || "";
+  const expected = "Bearer " + token;
+  const actualBytes = Buffer.from(authorization);
+  const expectedBytes = Buffer.from(expected);
+  if (actualBytes.length !== expectedBytes.length ||
+      !timingSafeEqual(actualBytes, expectedBytes)) {
+    res.set("WWW-Authenticate", 'Bearer realm="GAIA MCP"');
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  next();
+}
+app.use("/mcp", authorizeMcp);
 
 const transports = Object.create(null);
 
