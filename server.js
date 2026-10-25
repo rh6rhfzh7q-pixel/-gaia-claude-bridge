@@ -219,6 +219,24 @@ function createServer() {
       await c.query("COMMIT");return{conflict:false,item};
     }catch(e){await c.query("ROLLBACK");throw e}finally{c.release()}
   }));
+
+  server.registerTool("gaia_executive_review_record",{
+    description:"Save a dated executive portfolio assessment and explicit decision requests; this is not a user approval.",
+    inputSchema:{
+      actor:z.enum(["chatgpt","claude","user"]),
+      scope:z.string().min(1).default("portfolio"),
+      assessment:z.string().min(1),
+      decision_requests:z.array(z.string()).max(20).default([])
+    }
+  },memoryTool(async({actor,scope,assessment,decision_requests})=>{
+    const c=await pool.connect();
+    try{
+      await c.query("BEGIN");
+      const q=await c.query("INSERT INTO gaia_control_reviews(reviewed_by,scope,assessment,decision_requests) VALUES($1,$2,$3,$4::jsonb) RETURNING *",[actor,scope,assessment,JSON.stringify(decision_requests)]);
+      await c.query("INSERT INTO gaia_project_events(project_key,event_type,actor,payload) VALUES('gaia_system','executive_review_recorded',$1,$2::jsonb)",[actor,JSON.stringify({review_id:q.rows[0].id,scope})]);
+      await c.query("COMMIT");return{review:q.rows[0]};
+    }catch(e){await c.query("ROLLBACK");throw e}finally{c.release()}
+  }));
   return server;
 }
 
