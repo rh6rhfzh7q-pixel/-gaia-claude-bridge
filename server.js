@@ -163,6 +163,15 @@ function createServer() {
     const c=await pool.connect();try{await c.query("BEGIN");const q=await c.query("INSERT INTO gaia_project_messages(project_key,sender,recipient,subject,body) VALUES($1,$2,$3,$4,$5) RETURNING *",[project_key,sender,recipient,subject,body]);await c.query("INSERT INTO gaia_project_events(project_key,event_type,actor,payload) VALUES($1,'message_sent',$2,$3::jsonb)",[project_key,sender,JSON.stringify({message_id:q.rows[0].id,recipient,subject})]);await c.query("COMMIT");return{message:q.rows[0]}}catch(e){await c.query("ROLLBACK");throw e}finally{c.release()}
   }));
   server.registerTool("gaia_message_inbox",{description:"Read internal incoming messages",inputSchema:{recipient:z.enum(["claude","chatgpt"]),status:z.enum(["open","acknowledged","done","all"]).default("open"),limit:z.number().int().min(1).max(100).default(30)}},memoryTool(async({recipient,status,limit})=>({messages:(await pool.query("SELECT * FROM gaia_project_messages WHERE recipient IN ($1,'both') AND ($2='all' OR status=$2) ORDER BY id DESC LIMIT $3",[recipient,status,limit])).rows})));
+
+  server.registerTool("gaia_project_list",{description:"List all current GAIA project states with versions",inputSchema:{limit:z.number().int().min(1).max(100).default(50)}},memoryTool(async({limit})=>({projects:(await pool.query("SELECT * FROM gaia_project_state ORDER BY updated_at DESC LIMIT $1",[limit])).rows})));
+  server.registerTool("gaia_message_ack",{description:"Acknowledge or complete an incoming GAIA message. Only the recipient may act.",inputSchema:{id:z.number().int().min(1),actor:z.enum(["claude","chatgpt"]),status:z.enum(["acknowledged","done"])}},memoryTool(async({id,actor,status})=>{
+    const c=await pool.connect();try{await c.query("BEGIN");
+    const q=await c.query("UPDATE gaia_project_messages SET status=$3,updated_at=NOW() WHERE id=$1 AND recipient IN ($2,'both') AND status IN ('open','acknowledged') RETURNING *",[id,actor,status]);
+    if(!q.rows.length){await c.query("ROLLBACK");return{updated:false,message:"No eligible message, or already completed"}}
+    await c.query("INSERT INTO gaia_project_events(project_key,event_type,actor,payload) VALUES($1,'message_status_changed',$2,$3::jsonb)",[q.rows[0].project_key,actor,JSON.stringify({message_id:id,status})]);await c.query("COMMIT");return{updated:true,message:q.rows[0]};
+    }catch(e){await c.query("ROLLBACK");throw e}finally{c.release()}
+  }));
   return server;
 }
 
