@@ -199,6 +199,26 @@ function createServer() {
   },memoryTool(async({project_key,category,status,limit})=>({
     items:(await pool.query("SELECT * FROM gaia_control_items WHERE ($1::text IS NULL OR project_key=$1 OR $1=ANY(related_projects)) AND ($2::text IS NULL OR category=$2) AND ($3='all' OR status=$3) ORDER BY importance ASC,updated_at DESC LIMIT $4",[project_key??null,category??null,status,limit])).rows
   })));
+
+  server.registerTool("gaia_control_item_progress",{
+    description:"Versioned update of Control Tower status and next action. Source is required; stale updates are rejected.",
+    inputSchema:{
+      item_key:key,expected_version:z.number().int().min(1),
+      status:z.enum(["open","monitor","awaiting_user","closed","superseded"]),
+      next_action:z.string(),source_ref:z.string().min(1),
+      actor:z.enum(["chatgpt","claude","user"])
+    }
+  },memoryTool(async({item_key,expected_version,status,next_action,source_ref,actor})=>{
+    const c=await pool.connect();
+    try{
+      await c.query("BEGIN");
+      const q=await c.query("UPDATE gaia_control_items SET status=$3,next_action=$4,source_ref=$5,updated_by=$6,version=version+1,updated_at=NOW() WHERE item_key=$1 AND version=$2 RETURNING *",[item_key,expected_version,status,next_action,source_ref,actor]);
+      if(!q.rows.length){await c.query("ROLLBACK");return{conflict:true,message:"Read latest version; no changes made"};}
+      const item=q.rows[0];
+      await c.query("INSERT INTO gaia_project_events(project_key,event_type,actor,version,payload) VALUES($1,'control_item_updated',$2,$3,$4::jsonb)",[item.project_key??"gaia_system",actor,item.version,JSON.stringify({item_key,status,next_action})]);
+      await c.query("COMMIT");return{conflict:false,item};
+    }catch(e){await c.query("ROLLBACK");throw e}finally{c.release()}
+  }));
   return server;
 }
 
