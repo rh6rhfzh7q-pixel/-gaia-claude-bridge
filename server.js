@@ -172,6 +172,20 @@ function createServer() {
     await c.query("INSERT INTO gaia_project_events(project_key,event_type,actor,payload) VALUES($1,'message_status_changed',$2,$3::jsonb)",[q.rows[0].project_key,actor,JSON.stringify({message_id:id,status})]);await c.query("COMMIT");return{updated:true,message:q.rows[0]};
     }catch(e){await c.query("ROLLBACK");throw e}finally{c.release()}
   }));
+
+  server.registerTool("gaia_control_tower",{
+    description:"Read the current G.A.I.A. executive portfolio: projects, priorities, risks, dependencies, decisions, inbox counts and change cursor. On-demand only.",
+    inputSchema:{recent_events:z.number().int().min(0).max(25).default(10)}
+  },memoryTool(async({recent_events})=>{
+    const [p,c,m,e,r]=await Promise.all([
+      pool.query("SELECT project_key,status,version,updated_at,metadata->>'source' AS source_ref,metadata->>'as_of' AS source_date,LEFT(summary,400) AS summary FROM gaia_project_state WHERE project_key NOT LIKE 'test_%' AND COALESCE(metadata->>'business_project','true')<>'false' ORDER BY project_key"),
+      pool.query("SELECT item_key,category,project_key,title,assessment,next_action,owner,importance,status,evidence,source_ref,source_date,related_projects,version,updated_at FROM gaia_control_items WHERE status NOT IN ('closed','superseded') ORDER BY importance ASC,updated_at DESC LIMIT 100"),
+      pool.query("SELECT COUNT(*) FILTER (WHERE recipient IN ('claude','both'))::int AS claude_open,COUNT(*) FILTER (WHERE recipient IN ('chatgpt','both'))::int AS chatgpt_open FROM gaia_project_messages WHERE status='open'"),
+      pool.query("SELECT id,project_key,event_type,actor,version,created_at FROM gaia_project_events ORDER BY id DESC LIMIT $1",[recent_events]),
+      pool.query("SELECT id,scope,reviewed_by,assessment,decision_requests,created_at FROM gaia_control_reviews ORDER BY id DESC LIMIT 1")
+    ]);
+    return {as_of:new Date().toISOString(),limits:["Only saved information is available; no automatic chat sync or wake-up","Source dates may predate database updates"],projects:p.rows,control_items:c.rows,inbox:m.rows[0],recent_events:e.rows.reverse(),latest_review:r.rows[0]??null};
+  }));
   return server;
 }
 
