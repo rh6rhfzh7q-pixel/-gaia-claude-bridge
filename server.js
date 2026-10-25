@@ -148,6 +148,21 @@ function createServer() {
     );
     return { memory: rows[0] };
   }));
+
+  server.registerTool("gaia_project_get",{description:"Get shared project state and version",inputSchema:{project_key:key}},memoryTool(async({project_key})=>({project:(await pool.query("SELECT * FROM gaia_project_state WHERE project_key=$1",[project_key])).rows[0]??null})));
+  server.registerTool("gaia_project_update",{description:"Versioned project update. expected_version=0 creates new; otherwise match current version. Conflicts never overwrite.",inputSchema:{project_key:key,summary:z.string().min(1),status:z.string().min(1),actor:z.enum(["claude","chatgpt","user"]),expected_version:z.number().int().min(0),metadata:z.record(z.string(),z.json()).default({})}},memoryTool(async({project_key,summary,status,actor,expected_version,metadata})=>{
+    const c=await pool.connect();try{await c.query("BEGIN");let q;
+    if(expected_version===0)q=await c.query("INSERT INTO gaia_project_state(project_key,summary,status,updated_by,metadata) VALUES($1,$2,$3,$4,$5::jsonb) ON CONFLICT(project_key) DO NOTHING RETURNING *",[project_key,summary,status,actor,JSON.stringify(metadata)]);
+    else q=await c.query("UPDATE gaia_project_state SET summary=$2,status=$3,updated_by=$4,metadata=$5::jsonb,version=version+1,updated_at=NOW() WHERE project_key=$1 AND version=$6 RETURNING *",[project_key,summary,status,actor,JSON.stringify(metadata),expected_version]);
+    if(!q.rows.length){await c.query("ROLLBACK");return{conflict:true,message:"Read latest project version and retry; no data changed"}}
+    const p=q.rows[0];const e=await c.query("INSERT INTO gaia_project_events(project_key,event_type,actor,version,payload) VALUES($1,'state_updated',$2,$3,$4::jsonb) RETURNING id",[project_key,actor,p.version,JSON.stringify({summary,status,metadata})]);await c.query("COMMIT");return{conflict:false,project:p,event_id:e.rows[0].id};
+    }catch(e){await c.query("ROLLBACK");throw e}finally{c.release()}
+  }));
+  server.registerTool("gaia_changes_since",{description:"Read ordered changes after event ID; no automatic wake-up",inputSchema:{after_id:z.number().int().min(0).default(0),limit:z.number().int().min(1).max(100).default(50)}},memoryTool(async({after_id,limit})=>({events:(await pool.query("SELECT * FROM gaia_project_events WHERE id>$1 ORDER BY id ASC LIMIT $2",[after_id,limit])).rows})));
+  server.registerTool("gaia_message_send",{description:"Store a message for another assistant; does not activate the recipient",inputSchema:{project_key:key,sender:z.enum(["claude","chatgpt","user"]),recipient:z.enum(["claude","chatgpt","both"]),subject:z.string().min(1),body:z.string().min(1)}},memoryTool(async({project_key,sender,recipient,subject,body})=>{
+    const c=await pool.connect();try{await c.query("BEGIN");const q=await c.query("INSERT INTO gaia_project_messages(project_key,sender,recipient,subject,body) VALUES($1,$2,$3,$4,$5) RETURNING *",[project_key,sender,recipient,subject,body]);await c.query("INSERT INTO gaia_project_events(project_key,event_type,actor,payload) VALUES($1,'message_sent',$2,$3::jsonb)",[project_key,sender,JSON.stringify({message_id:q.rows[0].id,recipient,subject})]);await c.query("COMMIT");return{message:q.rows[0]}}catch(e){await c.query("ROLLBACK");throw e}finally{c.release()}
+  }));
+  server.registerTool("gaia_message_inbox",{description:"Read internal incoming messages",inputSchema:{recipient:z.enum(["claude","chatgpt"]),status:z.enum(["open","acknowledged","done","all"]).default("open"),limit:z.number().int().min(1).max(100).default(30)}},memoryTool(async({recipient,status,limit})=>({messages:(await pool.query("SELECT * FROM gaia_project_messages WHERE recipient IN ($1,'both') AND ($2='all' OR status=$2) ORDER BY id DESC LIMIT $3",[recipient,status,limit])).rows})));
   return server;
 }
 
