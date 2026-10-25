@@ -186,6 +186,19 @@ function createServer() {
     ]);
     return {as_of:new Date().toISOString(),limits:["Only saved information is available; no automatic chat sync or wake-up","Source dates may predate database updates"],projects:p.rows,control_items:c.rows,inbox:m.rows[0],recent_events:e.rows.reverse(),latest_review:r.rows[0]??null};
   }));
+
+  server.registerTool("gaia_control_item_get",{description:"Read one executive control item including provenance and version.",inputSchema:{item_key:key}},memoryTool(async({item_key})=>({item:(await pool.query("SELECT * FROM gaia_control_items WHERE item_key=$1",[item_key])).rows[0]??null})));
+  server.registerTool("gaia_control_items_list",{
+    description:"List strategic priorities, risks, dependencies, decisions and actions; optionally filter by related project.",
+    inputSchema:{
+      project_key:z.string().min(1).optional(),
+      category:z.enum(["priority","risk","dependency","decision","action"]).optional(),
+      status:z.enum(["open","monitor","awaiting_user","closed","superseded","all"]).default("all"),
+      limit:z.number().int().min(1).max(100).default(40)
+    }
+  },memoryTool(async({project_key,category,status,limit})=>({
+    items:(await pool.query("SELECT * FROM gaia_control_items WHERE ($1::text IS NULL OR project_key=$1 OR $1=ANY(related_projects)) AND ($2::text IS NULL OR category=$2) AND ($3='all' OR status=$3) ORDER BY importance ASC,updated_at DESC LIMIT $4",[project_key??null,category??null,status,limit])).rows
+  })));
   return server;
 }
 
