@@ -52,6 +52,41 @@ test("MCP rejects requests without valid credentials and limits request bodies",
     });
     assert.equal(oversized.status,413);
 
+
+    // Exercise the real MCP transport, not only the Express authentication layer.
+    const initialize = await fetch(base + "/mcp", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "Authorization": "Bearer " + token
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: {protocolVersion:"2025-06-18",capabilities:{},clientInfo:{name:"security-smoke",version:"1.0"}}
+      })
+    });
+    assert.equal(initialize.status, 200);
+    const sessionId = initialize.headers.get("mcp-session-id");
+    assert.ok(sessionId, "MCP initialization should establish a session");
+    const initializeBody = await initialize.text();
+    assert.match(initializeBody, /serverInfo/);
+
+    const toolsList = await fetch(base + "/mcp", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "Authorization": "Bearer " + token,
+        "MCP-Session-ID": sessionId
+      },
+      body: JSON.stringify({jsonrpc:"2.0",id:2,method:"tools/list",params:{}})
+    });
+    assert.equal(toolsList.status, 200);
+    const toolsBody = await toolsList.text();
+    assert.match(toolsBody, /gaia_control_tower/);
+    assert.match(toolsBody, /gaia_project_list/);
+
     const health = await fetch(base + "/health");
     assert.equal(health.status,503); // No database configured in this isolated test.
   } finally {
