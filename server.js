@@ -6,7 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "100kb" }));
 
 const pool = process.env.DATABASE_URL
   ? new pg.Pool({
@@ -80,7 +80,7 @@ function createServer() {
   const server = new McpServer({
     name: "gaia-claude-bridge",
     version: "1.0.0"
-  });
+  }, { maxToolInputElements: 512 });
   const namespace = z.string().min(1).default("gaia");
   const key = z.string().min(1);
 
@@ -340,8 +340,8 @@ app.get("/health", async (_req, res) => {
 app.use((error, _req, res, _next) => {
   console.error("Bridge request failed.");
   if (!res.headersSent) {
-    const status = error?.type === "entity.parse.failed" ? 400 : 500;
-    res.status(status).json({ error: status === 400 ? "Invalid JSON" : "Internal server error" });
+    const status = error?.status === 413 || error?.type === "entity.too.large" ? 413 : (error?.type === "entity.parse.failed" ? 400 : 500);
+    res.status(status).json({ error: status === 400 ? "Invalid JSON" : (status === 413 ? "Request too large" : "Internal server error") });
   } else {
     res.end();
   }
