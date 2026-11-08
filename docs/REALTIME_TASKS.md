@@ -79,6 +79,7 @@ Status: `CREATED → QUEUED → DISPATCHED → ACKNOWLEDGED → RUNNING → COMP
 | `GAIA_MCP_TOKEN` | bisheriger Token; kann nach Umstellung beider Assistenten entfernt werden |
 | `GAIA_CLAUDE_FIRE_URL` / `GAIA_CLAUDE_FIRE_TOKEN` | aus claude.ai/code/routines → Routine → API-Trigger |
 | `GAIA_DISPATCH_MAX_PER_HOUR` | optional, Standard 10 |
+| `GAIA_SQL_INTAKE_ROLE` | nur Staging: Postgres-Login-Rolle, deren Einträge in `gaia_task_intake` zu signierten ChatGPT-Aufträgen werden (siehe Staging-Eingang) |
 | `GAIA_DISPATCH_FIRE_BUDGET` | nur Testumgebung: `1` = höchstens ein Routine-Start insgesamt, keine Wiederholungen (siehe Testmodus) |
 | `GAIA_TASK_SIGNING_KEY` | **Pflicht für Task-Werkzeuge**: zufälliger Schlüssel ≥32 Zeichen, nur in Render; nie in Neon/Chats; Wechsel macht offene Aufträge nicht mehr ausführbar |
 
@@ -102,6 +103,33 @@ Für den ersten echten End-to-End-Test gibt es eine optionale, technisch erzwung
 - Ungültige Werte (z. B. `0`, `abc`, `101`) sperren jeden Remote-Start (fail closed). Ohne die Variable gilt der Normalbetrieb (bis zu 3 Versuche je Auftrag).
 - Zurücksetzen nur durch bewusste Änderung der Variable bzw. eine neue Testdatenbank.
 - Regressionstest: „fire budget (test mode): at most one remote start in total, never a retry“ und `test/fire-budget.test.js`.
+
+## Staging-Eingang über SQL für ChatGPT (V4.2.2, standardmäßig aus)
+
+Zweck: ChatGPT kann ohne eigenen MCP-Connector einen Auftrag in einer **isolierten Staging-Datenbank** hinterlegen. Die Schutzmechanismen von V4.2.1 bleiben unverändert.
+
+- Aktivierung nur über `GAIA_SQL_INTAKE_ROLE=<Postgres-Rolle>` in der Staging-Bridge. Ohne die Variable gibt es weder die Tabelle noch den Codepfad.
+- ChatGPT schreibt **keine Aufträge**, sondern Anfragen in `gaia_task_intake`. Ein Trigger setzt `author` zwingend auf die Login-Rolle (`session_user`). `SET ROLE` ändert sie nicht. Status- und Verwaltungsfelder kann der Einfügende nicht setzen.
+- Der 30-s-Abgleich wandelt nur Zeilen der konfigurierten Rolle über das unveränderte `createTask` in signierte Aufträge des Principals `chatgpt` um. Die Idempotenz läuft über `sql-intake-<id>`. Andere Absender werden mit `REJECTED/author_not_allowed` abgelehnt (Event `task_intake_rejected`).
+- Danach gilt der normale Ablauf: Startbegrenzung (`GAIA_DISPATCH_FIRE_BUDGET`), Claim mit `claim_token`, Lease, Policy. Das Event `task_created` trägt `origin=sql_intake:<id>`, dazu kommt `task_intake_converted`.
+- Ohne Signaturschlüssel wird nichts umgewandelt (fail closed). Direkt in `gaia_tasks` geschriebene Zeilen bleiben weiterhin nie ausführbar.
+- Rückmeldung: ChatGPT liest `gaia_task_intake` → `task_id` → `gaia_tasks.status/result` sowie `gaia_project_events`.
+- Grenze: Ein INSERT weckt eine schlafende Render-Bridge nicht. Vor dem Test `/health` aufrufen.
+
+Einmalige Einrichtung in der **Staging**-Datenbank (eigenes Neon-Projekt). Ausführen als Eigentümer, **nachdem** die Staging-Bridge einmal gestartet ist und damit `gaia_tasks` und `gaia_task_intake` angelegt hat. Die Rolle muss per SQL angelegt werden: In Neon über Console oder API angelegte Rollen gehören zu `neon_superuser` und wären nicht eingeschränkt.
+
+```sql
+CREATE ROLE gaia_chatgpt_intake LOGIN PASSWORD '<zufällig, nur in ChatGPTs Staging-Connector>';
+GRANT USAGE ON SCHEMA public TO gaia_chatgpt_intake;
+GRANT INSERT (project_key, task_type, subject, instructions, idempotency_key) ON gaia_task_intake TO gaia_chatgpt_intake;
+GRANT USAGE ON SEQUENCE gaia_task_intake_id_seq TO gaia_chatgpt_intake;
+GRANT SELECT ON gaia_task_intake, gaia_project_events TO gaia_chatgpt_intake;
+GRANT SELECT (id, sender, recipient, task_type, subject, status, outcome, result, last_error, created_at, completed_at) ON gaia_tasks TO gaia_chatgpt_intake;
+```
+
+ChatGPTs Staging-Zugang über den Neon-MCP-Server wird fest auf `?projectId=<Staging-Projekt>&roleName=gaia_chatgpt_intake` begrenzt. Laut Neon werden abweichende `role_name`-Argumente abgelehnt. Die Bridge selbst nutzt eine eigene Rolle, niemals `gaia_chatgpt_intake`.
+
+Regressionstest: „SQL intake (staging): only the configured login role can create signed tasks; budget still holds“ (Umwandlung, Signatur, Start genau einmal, `claim_token`, Rücklesen mit eingeschränkter Rolle, Idempotenz auch parallel, keine Fälschung über Spalten, `UPDATE`, `DELETE` oder `SET ROLE`, abgeschaltet ohne Rolle oder Schlüssel).
 
 ## Atomare Auditierung (V4)
 

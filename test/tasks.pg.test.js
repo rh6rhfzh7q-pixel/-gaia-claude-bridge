@@ -5,9 +5,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   ACK_TIMEOUT_MINUTES, EXECUTION_POLICY, TASK_SCHEMA_SQL, claimTask, completeTask, createTask, dispatchTask, getTask,
-  heartbeatTask, listTasks, readDispatchConfig, signTask, sweep
+  heartbeatTask, listTasks, processIntake, readDispatchConfig, signTask, sweep, TASK_INTAKE_SQL
 } from "../tasks.js";
 import { openIsolatedSchema, testDatabaseUrlProblem } from "../testing/guarded-db.js";
+import pg from "pg";
+import { randomBytes } from "node:crypto";
 
 const FIRE_URL = "https://api.anthropic.com/v1/claude_code/routines/trig_TEST123/fire";
 const SECRET = "sk-ant-oat01-" + "S".repeat(40);
@@ -615,6 +617,99 @@ test("task queue against PostgreSQL (isolated schema)", { skip: unsafe ?? false 
       const fz = fakeFetch(200);
       assert.equal((await dispatchTask(pool, { taskId: z.id, config: zero, fetchImpl: fz })).reason, "fire_budget_exhausted");
       await fires(0, fz);
+    });
+
+    await t.test("SQL intake (staging): only the configured login role can create signed tasks; budget still holds", async () => {
+      await fresh();
+      await pool.query(TASK_INTAKE_SQL);
+      await pool.query(TASK_INTAKE_SQL); // idempotent
+      const role = "gaia_it_intake_" + randomBytes(4).toString("hex");
+      const password = randomBytes(12).toString("hex");
+      await pool.query(`CREATE ROLE ${role} LOGIN PASSWORD '${password}'`);
+      const url = new URL(process.env.GAIA_TEST_DATABASE_URL);
+      url.username = role; url.password = password;
+      const chat = new pg.Pool({ connectionString: url.toString(), options: `-c search_path=${db.schema}` });
+      try {
+        // Minimal grants as documented: insert payload columns, read results, nothing else.
+        await pool.query(`GRANT USAGE ON SCHEMA ${db.schema} TO ${role}`);
+        await pool.query(`GRANT INSERT (project_key, task_type, subject, instructions, idempotency_key) ON gaia_task_intake TO ${role}`);
+        await pool.query(`GRANT USAGE ON SEQUENCE gaia_task_intake_id_seq TO ${role}`);
+        await pool.query(`GRANT SELECT ON gaia_task_intake, gaia_project_events TO ${role}`);
+        await pool.query(`GRANT SELECT (id, sender, recipient, task_type, subject, status, outcome, result, last_error, created_at, completed_at) ON gaia_tasks TO ${role}`);
+        const cfg = readDispatchConfig({ ...ENV, GAIA_DISPATCH_FIRE_BUDGET: "1", GAIA_SQL_INTAKE_ROLE: role });
+        assert.equal(cfg.intakeRole, role);
+        const ins = (cols, vals) => chat.query(`INSERT INTO gaia_task_intake(${cols}) VALUES(${vals.map((_, i) => "$" + (i + 1))}) RETURNING id, author, status`, vals);
+
+        // 1) Legitimate request -> exactly one signed, executable task from "chatgpt", dispatched once.
+        const req = (await ins("task_type, subject, instructions, idempotency_key", ["TASK", "E2E-Test", "Bitte 17+25 rechnen.", "e2e-intake-0001"])).rows[0];
+        assert.equal(req.author, role);
+        const f = fakeFetch(200);
+        const s1 = await sweep(pool, { config: cfg, fetchImpl: f });
+        assert.equal(s1.intake.converted, 1);
+        const conv = (await pool.query("SELECT * FROM gaia_task_intake WHERE id=$1", [req.id])).rows[0];
+        assert.equal(conv.status, "CONVERTED");
+        const task = (await getTask(pool, Number(conv.task_id), CLAUDE)).task;
+        assert.equal(task.sender, "chatgpt");
+        assert.equal(task.executable, true);
+        assert.equal(task.status, "DISPATCHED");
+        assert.equal(f.calls.length, 1);
+        const ev = await events(task.id);
+        assert.deepEqual(ev.slice(0, 5), ["task_created", "task_queued", "task_intake_converted", "task_dispatch_attempt", "task_dispatched"]);
+        const created = (await getTask(pool, task.id, GPT)).events.find((e) => e.event_type === "task_created");
+        assert.equal(created.payload.origin, `sql_intake:${req.id}`);
+        // claim_token protection unchanged: Claude claims and completes with its token.
+        const cl = await claimTask(pool, { taskId: task.id, ...CLAUDE });
+        assert.equal(cl.claimed, true);
+        assert.equal((await completeTask(pool, { taskId: task.id, ...CLAUDE, claimToken: cl.claim_token, outcome: "completed", result: "42" })).completed, true);
+        // ChatGPT reads the result with its restricted role.
+        const back = (await chat.query("SELECT t.status, t.result FROM gaia_task_intake i JOIN gaia_tasks t ON t.id=i.task_id WHERE i.id=$1", [req.id])).rows[0];
+        assert.deepEqual(back, { status: "COMPLETED", result: "42" });
+        await assert.rejects(() => chat.query("SELECT signature FROM gaia_tasks LIMIT 1"), /permission denied/);
+
+        // 2) Idempotent: further sweeps and concurrent processing never create a second task.
+        await Promise.all([sweep(pool, { config: cfg, fetchImpl: f }), processIntake(pool, cfg), processIntake(pool, cfg)]);
+        assert.equal((await pool.query("SELECT COUNT(*)::int AS n FROM gaia_tasks WHERE idempotency_key=$1", [`sql-intake-${req.id}`])).rows[0].n, 1);
+
+        // 3) The restricted role cannot spoof or tamper.
+        await assert.rejects(() => ins("task_type, subject, instructions, author", ["TASK", "s", "i", "postgres"]), /permission denied/);
+        await assert.rejects(() => ins("task_type, subject, instructions, status", ["TASK", "s", "i", "CONVERTED"]), /permission denied/);
+        await assert.rejects(() => chat.query("UPDATE gaia_task_intake SET subject='x'"), /permission denied/);
+        await assert.rejects(() => chat.query("DELETE FROM gaia_project_events"), /permission denied/);
+        await assert.rejects(() => chat.query("INSERT INTO gaia_tasks(project_key,sender,recipient,task_type,subject,instructions) VALUES('x','chatgpt','claude','TASK','s','i')"), /permission denied/);
+
+        // 4) Rows from any other login role are rejected - also via SET ROLE (session_user stays the owner).
+        const own = (await pool.query("INSERT INTO gaia_task_intake(task_type, subject, instructions) VALUES('TASK','fremd','i') RETURNING id, author")).rows[0];
+        assert.notEqual(own.author, role);
+        const c = await pool.connect();
+        let viaSetRole;
+        try {
+          await c.query(`SET ROLE ${role}`);
+          viaSetRole = (await c.query("INSERT INTO gaia_task_intake(task_type, subject, instructions) VALUES('TASK','set role','i') RETURNING id, author")).rows[0];
+        } finally { await c.query("RESET ROLE"); c.release(); }
+        assert.notEqual(viaSetRole.author, role);
+        // 5) Budget still holds: a second legitimate request becomes a task but is never fired.
+        const req2 = (await ins("task_type, subject, instructions", ["TASK", "zweiter", "i"])).rows[0];
+        const s2 = await sweep(pool, { config: cfg, fetchImpl: f });
+        assert.equal(s2.intake.rejected, 2);
+        assert.equal(s2.intake.converted, 1);
+        for (const id of [own.id, viaSetRole.id]) {
+          const r = (await pool.query("SELECT status, reason, task_id FROM gaia_task_intake WHERE id=$1", [id])).rows[0];
+          assert.deepEqual(r, { status: "REJECTED", reason: "author_not_allowed", task_id: null });
+        }
+        const t2 = Number((await pool.query("SELECT task_id FROM gaia_task_intake WHERE id=$1", [req2.id])).rows[0].task_id);
+        assert.equal((await getTask(pool, t2, GPT)).task.last_error, "fire_budget_exhausted");
+        assert.equal(f.calls.length, 1, "still exactly one remote start");
+
+        // 6) Disabled (no role configured) or no signing key: nothing is converted.
+        await ins("task_type, subject, instructions", ["TASK", "aus", "i"]);
+        assert.equal((await sweep(pool, { config: readDispatchConfig(ENV), fetchImpl: f })).intake, null);
+        assert.deepEqual(await processIntake(pool, { intakeRole: role, signingKey: null }), { converted: 0, rejected: 0 });
+        assert.equal((await pool.query("SELECT COUNT(*)::int AS n FROM gaia_task_intake WHERE status='NEW'")).rows[0].n, 1);
+      } finally {
+        await chat.end();
+        await pool.query(`DROP OWNED BY ${role}`);
+        await pool.query(`DROP ROLE ${role}`);
+      }
     });
 
     await t.test("fallbacks: no ChatGPT trigger; unconfigured Claude re-armed once configured", async () => {

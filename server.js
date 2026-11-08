@@ -6,7 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import {
-  DISPATCHING_TYPES, TASK_SCHEMA_SQL, claimTask, completeTask, createTask, dispatchTask, getTask, heartbeatTask,
+  DISPATCHING_TYPES, TASK_INTAKE_SQL, TASK_SCHEMA_SQL, claimTask, completeTask, createTask, dispatchTask, getTask, heartbeatTask,
   listTasks, readDispatchConfig, readSigningKey, sweep
 } from "./tasks.js";
 import { TASK_PRINCIPALS, resolvePrincipal } from "./auth.js";
@@ -322,7 +322,7 @@ function createServer({ principal } = {}) {
 let taskSchema;
 function ensureTasks(){
   if(!taskSchema){
-    taskSchema=ensureMemory().then(()=>pool.query(TASK_SCHEMA_SQL)).catch((error)=>{taskSchema=undefined;throw error;});
+    taskSchema=ensureMemory().then(()=>pool.query(TASK_SCHEMA_SQL)).then(()=>readDispatchConfig().intakeRole?pool.query(TASK_INTAKE_SQL):null).catch((error)=>{taskSchema=undefined;throw error;});
   }
   return taskSchema;
 }

@@ -76,11 +76,97 @@ export function readDispatchConfig(env = process.env) {
     maxPerHour: Number.isInteger(cap) && cap > 0 && cap <= 30 ? cap : DEFAULT_MAX_PER_HOUR,
     fireBudget,
     maxAttempts: fireBudget === null ? MAX_DISPATCH_ATTEMPTS : 1,
+    intakeRole: readIntakeRole(env),
     signingKey: readSigningKey(env)
   };
 }
 
 const maxAttemptsOf = (config) => config?.maxAttempts ?? MAX_DISPATCH_ATTEMPTS;
+
+// Optional SQL intake for ChatGPT (staging only, GAIA_SQL_INTAKE_ROLE).
+// Unset or invalid: disabled - no table, no code path.
+// Set to a Postgres role name: rows in gaia_task_intake whose author (stamped
+// by a trigger from session_user, never from the inserter) equals that role
+// are turned into tasks from principal "chatgpt" through the regular,
+// signed createTask path. Everything after that is unchanged V4.2.1.
+const ROLE_NAME_PATTERN = /^[a-z_][a-z0-9_]{0,62}$/;
+export function readIntakeRole(env = process.env) {
+  const role = env.GAIA_SQL_INTAKE_ROLE || "";
+  return ROLE_NAME_PATTERN.test(role) ? role : null;
+}
+
+export const TASK_INTAKE_SQL = `
+CREATE TABLE IF NOT EXISTS gaia_task_intake (
+  id BIGSERIAL PRIMARY KEY,
+  author TEXT NOT NULL DEFAULT session_user,
+  project_key TEXT NOT NULL DEFAULT 'gaia_system',
+  task_type TEXT NOT NULL CHECK (task_type IN ('TASK','QUESTION','UPDATE','ACK')),
+  subject TEXT NOT NULL CHECK (length(subject) BETWEEN 1 AND 200),
+  instructions TEXT NOT NULL CHECK (length(instructions) BETWEEN 1 AND 20000),
+  idempotency_key TEXT UNIQUE CHECK (idempotency_key IS NULL OR length(idempotency_key) BETWEEN 8 AND 100),
+  status TEXT NOT NULL DEFAULT 'NEW' CHECK (status IN ('NEW','CONVERTED','REJECTED')),
+  task_id BIGINT REFERENCES gaia_tasks(id),
+  reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  processed_at TIMESTAMPTZ
+);
+-- The author is the login role of the inserting session. SET ROLE does not
+-- change session_user, and the inserter cannot set any bookkeeping column.
+CREATE OR REPLACE FUNCTION gaia_task_intake_stamp() RETURNS trigger LANGUAGE plpgsql AS $gaia$
+BEGIN
+  NEW.author := session_user;
+  NEW.status := 'NEW';
+  NEW.task_id := NULL;
+  NEW.reason := NULL;
+  NEW.processed_at := NULL;
+  NEW.created_at := NOW();
+  RETURN NEW;
+END
+$gaia$;
+CREATE OR REPLACE TRIGGER gaia_task_intake_stamp BEFORE INSERT ON gaia_task_intake
+  FOR EACH ROW EXECUTE FUNCTION gaia_task_intake_stamp();
+`;
+
+// Converts pending intake rows. Idempotent: the task idempotency key
+// "sql-intake-<id>" guarantees at most one task per intake row, also under
+// concurrency. Without a signing key nothing is converted (fail closed).
+export async function processIntake(pool, { intakeRole, signingKey, limit = 5 }) {
+  if (!intakeRole || !signingKey) return { converted: 0, rejected: 0 };
+  const pending = await pool.query(
+    "SELECT * FROM gaia_task_intake WHERE status='NEW' ORDER BY id ASC LIMIT $1", [limit]
+  );
+  let converted = 0, rejected = 0;
+  for (const row of pending.rows) {
+    const reject = async (reason) => {
+      const r = await pool.query(
+        `WITH u AS (UPDATE gaia_task_intake SET status='REJECTED', reason=$2, processed_at=NOW()
+                    WHERE id=$1 AND status='NEW' RETURNING id, project_key, author)
+         INSERT INTO gaia_project_events(project_key,event_type,actor,payload)
+         SELECT project_key, 'task_intake_rejected', 'bridge',
+                jsonb_build_object('intake_id', id, 'author', author, 'reason', $2::text) FROM u RETURNING id`,
+        [row.id, reason]
+      );
+      rejected += r.rows.length;
+    };
+    if (row.author !== intakeRole) { await reject("author_not_allowed"); continue; }
+    const created = await createTask(pool, {
+      project_key: row.project_key, recipient: "claude", task_type: row.task_type, subject: row.subject,
+      instructions: row.instructions, idempotency_key: `sql-intake-${row.id}`
+    }, { principal: "chatgpt", signingKey, origin: `sql_intake:${row.id}` });
+    const task = created.task;
+    if (!task) { await reject(created.reason || "not_converted"); continue; }
+    const u = await pool.query(
+      `WITH u AS (UPDATE gaia_task_intake SET status='CONVERTED', task_id=$2, processed_at=NOW()
+                  WHERE id=$1 AND status='NEW' RETURNING id, project_key, author)
+       INSERT INTO gaia_project_events(project_key,event_type,actor,payload)
+       SELECT project_key, 'task_intake_converted', 'bridge',
+              jsonb_build_object('intake_id', id, 'author', author, 'task_id', $2::bigint) FROM u RETURNING id`,
+      [row.id, task.id]
+    );
+    converted += u.rows.length;
+  }
+  return { converted, rejected };
+}
 
 // Binding policy returned with every successful claim. Code cannot stop an
 // executor from using its own tools, so the policy is explicit, versioned and
@@ -234,7 +320,7 @@ function requireTaskPrincipal(principal) {
 
 // sender is the authenticated principal; callers cannot choose it.
 // Idempotency is atomic: INSERT ... ON CONFLICT (idempotency_key) DO NOTHING.
-export async function createTask(pool, input, { principal, signingKey }) {
+export async function createTask(pool, input, { principal, signingKey, origin = "mcp" }) {
   requireTaskPrincipal(principal);
   if (!signingKey) return { created: false, reason: "signing_key_not_configured" };
   const sender = principal;
@@ -270,7 +356,7 @@ export async function createTask(pool, input, { principal, signingKey }) {
     const dispatching = DISPATCHING_TYPES.has(task_type);
     await logEvent(c, { projectKey: project_key, eventType: "task_created", actor: sender,
       payload: { task_id: Number(task.id), recipient, task_type, round, parent_task_id: parent_task_id ?? null,
-        subject, sender_verified: true, signed: true } });
+        subject, sender_verified: true, signed: true, origin } });
     const queued = await c.query(
       "UPDATE gaia_tasks SET signature=$3,status='QUEUED',queued_at=NOW(),next_dispatch_at=CASE WHEN $2 THEN NOW() ELSE NULL END,updated_at=NOW() WHERE id=$1 RETURNING *",
       [task.id, dispatching, signature]
@@ -627,6 +713,8 @@ export async function listTasks(pool, { role, status, limit }, { principal, sign
 // single statement (data-modifying CTE), so a change without an event – or an
 // event without a change – cannot persist.
 export async function sweep(pool, { config, fetchImpl = fetch } = {}) {
+  // Optional staging intake first, so converted tasks are dispatched in this run.
+  const intake = config?.intakeRole ? await processIntake(pool, { intakeRole: config.intakeRole, signingKey: config.signingKey }) : null;
   // Tasks inserted directly via SQL start as CREATED. They become visible
   // (QUEUED) for review, but without a valid signature they can never be
   // dispatched or claimed.
@@ -690,5 +778,5 @@ export async function sweep(pool, { config, fetchImpl = fetch } = {}) {
   for (const row of due.rows) {
     results.push({ task_id: Number(row.id), ...(await dispatchTask(pool, { taskId: row.id, config, fetchImpl })) });
   }
-  return { promoted: promoted.rows.length, requeued: requeued.rows.length, failed: timedOut.rows.length, dispatched: results };
+  return { promoted: promoted.rows.length, requeued: requeued.rows.length, failed: timedOut.rows.length, dispatched: results, intake };
 }
