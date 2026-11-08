@@ -79,6 +79,7 @@ Status: `CREATED → QUEUED → DISPATCHED → ACKNOWLEDGED → RUNNING → COMP
 | `GAIA_MCP_TOKEN` | bisheriger Token; kann nach Umstellung beider Assistenten entfernt werden |
 | `GAIA_CLAUDE_FIRE_URL` / `GAIA_CLAUDE_FIRE_TOKEN` | aus claude.ai/code/routines → Routine → API-Trigger |
 | `GAIA_DISPATCH_MAX_PER_HOUR` | optional, Standard 10 |
+| `GAIA_DISPATCH_FIRE_BUDGET` | nur Testumgebung: `1` = höchstens ein Routine-Start insgesamt, keine Wiederholungen (siehe Testmodus) |
 | `GAIA_TASK_SIGNING_KEY` | **Pflicht für Task-Werkzeuge**: zufälliger Schlüssel ≥32 Zeichen, nur in Render; nie in Neon/Chats; Wechsel macht offene Aufträge nicht mehr ausführbar |
 
 ## Datenbank
@@ -90,6 +91,17 @@ Additiv: neue Tabelle `gaia_tasks` (`CREATE TABLE IF NOT EXISTS` + `ADD COLUMN I
 - **Versionsprüfung der Startversuche:** Antworten eines Startversuchs ändern den Auftrag nur, wenn `dispatch_attempts` noch dem eigenen Versuch entspricht. Verspätete Antworten älterer Versuche ändern nichts und werden als `task_dispatch_stale_response` protokolliert.
 - **Verspäteter Abschluss vor dem Abgleich:** Ist die Lease abgelaufen, der Abgleich aber noch nicht gelaufen, beendet `gaia_task_complete` (nur mit gültigem Claim-Token) die Nachverfolgung sofort atomar: `FAILED`/`tracking_lease_expired`, Events `task_failed` (`detected_by=late_completion`) und `task_late_completion_rejected`; das Ergebnis wird nicht gespeichert.
 - **CHECK-Migration:** `gaia_tasks_execution_scope_internal_only` ist benannt und wird für bestehende Tabellen idempotent per `DO`-Block ergänzt (`NOT VALID` + `VALIDATE`). Verletzt eine Altzeile die Regel, scheitert die Migration laut (fail closed).
+
+## Testmodus: harte Startbegrenzung (V4.2.1)
+
+Für den ersten echten End-to-End-Test gibt es eine optionale, technisch erzwungene Startbegrenzung:
+
+- `GAIA_DISPATCH_FIRE_BUDGET=1` (nur in der isolierten Test-Bridge setzen): **höchstens ein** Aufruf der Anthropic-Fire-API für die gesamte (Test-)Datenbank. Gezählt wird atomar unter derselben Advisory-Sperre wie die Reservierung (`task_dispatch_attempt`-Events), daher auch bei parallelen Dispatchern nie mehr als einer.
+- Zugleich genau **ein Versuch pro Auftrag**: kein Wiederholungsversuch nach Timeout, Netzwerkfehler, 5xx, 4xx oder fehlendem ACK. Ein mehrdeutiger Start bleibt bis zum Ende des ACK-Fensters übernehmbar und wird danach ohne weiteren Start `FAILED`.
+- Weitere Aufträge werden mit `last_error='fire_budget_exhausted'` geparkt (Event `task_dispatch_skipped`) und nicht gestartet.
+- Ungültige Werte (z. B. `0`, `abc`, `101`) sperren jeden Remote-Start (fail closed). Ohne die Variable gilt der Normalbetrieb (bis zu 3 Versuche je Auftrag).
+- Zurücksetzen nur durch bewusste Änderung der Variable bzw. eine neue Testdatenbank.
+- Regressionstest: „fire budget (test mode): at most one remote start in total, never a retry“ und `test/fire-budget.test.js`.
 
 ## Atomare Auditierung (V4)
 

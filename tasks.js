@@ -52,16 +52,35 @@ export const DEFAULT_MAX_PER_HOUR = 10;
 const FIRE_URL_PATTERN =
   /^https:\/\/api\.anthropic\.com\/v1\/claude_code\/routines\/trig_[A-Za-z0-9]+\/fire$/;
 
+// Optional hard fire budget for controlled tests (GAIA_DISPATCH_FIRE_BUDGET).
+// Unset: normal operation (up to MAX_DISPATCH_ATTEMPTS per task).
+// Set to N (1..100): at most N remote fire requests in total for this database,
+// counted atomically from task_dispatch_attempt events, and exactly ONE attempt
+// per task - no retry after timeout, network error, 5xx, 4xx or missing ACK.
+// Any other value fails closed (budget 0 = no remote start at all).
+export function readFireBudget(env = process.env) {
+  const raw = env.GAIA_DISPATCH_FIRE_BUDGET;
+  if (raw === undefined || raw === "") return null;
+  if (!/^\d+$/.test(raw)) return 0;
+  const n = Number.parseInt(raw, 10);
+  return n >= 1 && n <= 100 ? n : 0;
+}
+
 export function readDispatchConfig(env = process.env) {
   const url = env.GAIA_CLAUDE_FIRE_URL || "";
   const token = env.GAIA_CLAUDE_FIRE_TOKEN || "";
   const cap = Number.parseInt(env.GAIA_DISPATCH_MAX_PER_HOUR || "", 10);
+  const fireBudget = readFireBudget(env);
   return {
     claude: FIRE_URL_PATTERN.test(url) && token.length >= 20 ? { url, token } : null,
     maxPerHour: Number.isInteger(cap) && cap > 0 && cap <= 30 ? cap : DEFAULT_MAX_PER_HOUR,
+    fireBudget,
+    maxAttempts: fireBudget === null ? MAX_DISPATCH_ATTEMPTS : 1,
     signingKey: readSigningKey(env)
   };
 }
+
+const maxAttemptsOf = (config) => config?.maxAttempts ?? MAX_DISPATCH_ATTEMPTS;
 
 // Binding policy returned with every successful claim. Code cannot stop an
 // executor from using its own tools, so the policy is explicit, versioned and
@@ -263,9 +282,31 @@ export async function createTask(pool, input, { principal, signingKey }) {
 }
 
 // Atomically reserve one dispatch attempt (lease = next_dispatch_at + 10 min).
-async function reserveDispatch(pool, taskId, maxPerHour, signingKey) {
+// With a fire budget the total count is checked under the same advisory lock,
+// so concurrent dispatchers can never exceed it.
+async function reserveDispatch(pool, taskId, config) {
+  const { maxPerHour, signingKey, fireBudget } = config;
   return inTransaction(pool, async (c) => {
     await c.query("SELECT pg_advisory_xact_lock(hashtext('gaia_task_dispatch'))");
+    if (fireBudget !== null && fireBudget !== undefined) {
+      const total = await c.query(
+        "SELECT COUNT(*)::int AS n FROM gaia_project_events WHERE event_type='task_dispatch_attempt' AND payload->>'recipient'='claude'"
+      );
+      if (total.rows[0].n >= fireBudget) {
+        const parked = await c.query(
+          `UPDATE gaia_tasks SET next_dispatch_at=NULL, last_error='fire_budget_exhausted', updated_at=NOW()
+           WHERE id=$1 AND status='QUEUED' AND (last_error IS DISTINCT FROM 'fire_budget_exhausted')
+           RETURNING id, project_key`,
+          [taskId]
+        );
+        if (parked.rows.length) {
+          await logEvent(c, { projectKey: parked.rows[0].project_key, eventType: "task_dispatch_skipped", actor: "bridge",
+            payload: { task_id: Number(taskId), recipient: "claude", reason: "fire_budget_exhausted",
+              fire_budget: fireBudget, fires_used: total.rows[0].n } });
+        }
+        return { reserved: false, reason: "fire_budget_exhausted" };
+      }
+    }
     const recent = await c.query(
       "SELECT COUNT(*)::int AS n FROM gaia_project_events WHERE event_type='task_dispatch_attempt' AND payload->>'recipient'='claude' AND created_at > NOW() - INTERVAL '1 hour'"
     );
@@ -278,7 +319,7 @@ async function reserveDispatch(pool, taskId, maxPerHour, signingKey) {
        WHERE id=$1 AND recipient='claude' AND status='QUEUED' AND task_type IN ('TASK','QUESTION')
          AND next_dispatch_at IS NOT NULL AND next_dispatch_at <= NOW() AND dispatch_attempts < $2
        RETURNING *`,
-      [taskId, MAX_DISPATCH_ATTEMPTS]
+      [taskId, maxAttemptsOf(config)]
     );
     if (!r.rows.length) return { reserved: false, reason: "not_due_or_not_dispatchable" };
     const task = r.rows[0];
@@ -310,8 +351,8 @@ async function staleResult(c, task, details) {
 // When the LAST attempt is ambiguous, the task is not failed immediately: a
 // remote session may still claim it. It stays QUEUED (no further fire) and is
 // failed by the sweep only after the ACK window, if nobody claimed it.
-async function recordDispatchFailure(pool, task, { reason, kind, retryAfterSeconds, details }) {
-  const exhausted = task.dispatch_attempts >= MAX_DISPATCH_ATTEMPTS;
+async function recordDispatchFailure(pool, task, { reason, kind, retryAfterSeconds, details, maxAttempts }) {
+  const exhausted = task.dispatch_attempts >= (maxAttempts ?? MAX_DISPATCH_ATTEMPTS);
   if (exhausted && kind === "ambiguous") {
     return inTransaction(pool, async (c) => {
       const u = await c.query(
@@ -386,7 +427,7 @@ export async function dispatchTask(pool, { taskId, config, fetchImpl = fetch, no
       : { dispatched: false, reason: parkReason, fallback: "scheduled_sync" };
   }
 
-  const reservation = await reserveDispatch(pool, taskId, config.maxPerHour, config.signingKey);
+  const reservation = await reserveDispatch(pool, taskId, config);
   if (!reservation.reserved) return { dispatched: false, reason: reservation.reason };
   const task = reservation.task;
 
@@ -406,7 +447,7 @@ export async function dispatchTask(pool, { taskId, config, fetchImpl = fetch, no
   } catch (error) {
     return recordDispatchFailure(pool, task, {
       reason: error?.name === "TimeoutError" ? "timeout" : "network_error", kind: "ambiguous",
-      details: { latency_ms: now() - started }
+      details: { latency_ms: now() - started }, maxAttempts: maxAttemptsOf(config)
     });
   }
   const latency = now() - started;
@@ -418,7 +459,7 @@ export async function dispatchTask(pool, { taskId, config, fetchImpl = fetch, no
       reason: "http_" + response.status,
       kind: response.status >= 500 ? "ambiguous" : "definite",
       retryAfterSeconds: Number.isInteger(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 3600) : 0,
-      details: { http_status: response.status, error_type: errorType, latency_ms: latency }
+      details: { http_status: response.status, error_type: errorType, latency_ms: latency }, maxAttempts: maxAttemptsOf(config)
     });
   }
   let session = null;
@@ -622,7 +663,7 @@ export async function sweep(pool, { config, fetchImpl = fetch } = {}) {
      SELECT project_key, 'task_dispatch_retry_scheduled', 'bridge',
             jsonb_build_object('task_id', id, 'reason', 'no_ack_timeout', 'kind', 'ambiguous')
      FROM u RETURNING id`,
-    [ACK_TIMEOUT_MINUTES, MAX_DISPATCH_ATTEMPTS]
+    [ACK_TIMEOUT_MINUTES, maxAttemptsOf(config)]
   );
   // Lease expiry ends TRACKING; it does not cancel a running executor.
   const timedOut = await pool.query(
@@ -638,7 +679,7 @@ export async function sweep(pool, { config, fetchImpl = fetch } = {}) {
      INSERT INTO gaia_project_events(project_key,event_type,actor,payload)
      SELECT project_key, 'task_failed', 'bridge', jsonb_build_object('task_id', id, 'reason', last_error)
      FROM u RETURNING id`,
-    [ACK_TIMEOUT_MINUTES, MAX_DISPATCH_ATTEMPTS]
+    [ACK_TIMEOUT_MINUTES, maxAttemptsOf(config)]
   );
   const due = await pool.query(
     `SELECT id FROM gaia_tasks WHERE status='QUEUED' AND task_type IN ('TASK','QUESTION')

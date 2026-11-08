@@ -541,6 +541,82 @@ test("task queue against PostgreSQL (isolated schema)", { skip: unsafe ?? false 
       ), /check constraint/i);
     });
 
+    await t.test("fire budget (test mode): at most one remote start in total, never a retry", async () => {
+      const once = readDispatchConfig({ ...ENV, GAIA_DISPATCH_FIRE_BUDGET: "1" });
+      assert.equal(once.fireBudget, 1);
+      assert.equal(once.maxAttempts, 1);
+      const fires = async (n, f) => assert.equal(f.calls.length, n);
+
+      // 1) Ambiguous first fire (timeout): no retry, not even after the ACK window.
+      await fresh();
+      const a = (await createTask(pool, base, GPT)).task;
+      const f = fakeFetch("timeout", 200);
+      const r = await dispatchTask(pool, { taskId: a.id, config: once, fetchImpl: f });
+      assert.equal(r.kind, "ambiguous");
+      assert.equal(r.awaiting_ack, true, "single attempt is already the last one");
+      await due(a.id);
+      await sweep(pool, { config: once, fetchImpl: f });
+      await fires(1, f);
+      // 2) A second task is refused by the global budget and parked with an audit event.
+      const b = (await createTask(pool, base, GPT)).task;
+      const rb = await dispatchTask(pool, { taskId: b.id, config: once, fetchImpl: f });
+      assert.equal(rb.reason, "fire_budget_exhausted");
+      await fires(1, f);
+      const rowB = (await getTask(pool, b.id, GPT)).task;
+      assert.equal(rowB.status, "QUEUED");
+      assert.equal(rowB.last_error, "fire_budget_exhausted");
+      assert.ok((await events(b.id)).includes("task_dispatch_skipped"));
+      await sweep(pool, { config: once, fetchImpl: f });
+      await fires(1, f);
+      // The started session (if any) can still claim the first task; nothing re-fires.
+      assert.equal((await claimTask(pool, { taskId: a.id, ...CLAUDE })).claimed, true);
+
+      // 3) Concurrent dispatchers: exactly one HTTP request.
+      await fresh();
+      const c1 = (await createTask(pool, base, GPT)).task;
+      const c2 = (await createTask(pool, base, GPT)).task;
+      const fc = fakeFetch(200);
+      const both = await Promise.all([
+        dispatchTask(pool, { taskId: c1.id, config: once, fetchImpl: fc }),
+        dispatchTask(pool, { taskId: c2.id, config: once, fetchImpl: fc }),
+        sweep(pool, { config: once, fetchImpl: fc })
+      ]);
+      await fires(1, fc);
+      assert.equal([both[0], both[1]].filter((d) => d.dispatched).length, 1);
+
+      // 4) Definite rejection (4xx): FAILED at once, no backoff retry.
+      await fresh();
+      const d = (await createTask(pool, base, GPT)).task;
+      const fd = fakeFetch(401, 200);
+      const rd = await dispatchTask(pool, { taskId: d.id, config: once, fetchImpl: fd });
+      assert.equal(rd.retry_scheduled, false);
+      assert.equal((await getTask(pool, d.id, GPT)).task.status, "FAILED");
+      await sweep(pool, { config: once, fetchImpl: fd });
+      await fires(1, fd);
+
+      // 5) Successful start without ACK: no re-queue, FAILED after the ACK window.
+      await fresh();
+      const e = (await createTask(pool, base, GPT)).task;
+      const fe = fakeFetch(200, 200);
+      await dispatchTask(pool, { taskId: e.id, config: once, fetchImpl: fe });
+      await pool.query("UPDATE gaia_tasks SET dispatched_at=NOW()-INTERVAL '20 minutes' WHERE id=$1", [e.id]);
+      const s = await sweep(pool, { config: once, fetchImpl: fe });
+      assert.equal(s.requeued, 0);
+      await fires(1, fe);
+      const rowE = (await getTask(pool, e.id, GPT)).task;
+      assert.equal(rowE.status, "FAILED");
+      assert.equal(rowE.last_error, "no_ack_after_max_attempts");
+
+      // 6) Invalid budget value fails closed: no remote start at all.
+      await fresh();
+      const zero = readDispatchConfig({ ...ENV, GAIA_DISPATCH_FIRE_BUDGET: "eins" });
+      assert.equal(zero.fireBudget, 0);
+      const z = (await createTask(pool, base, GPT)).task;
+      const fz = fakeFetch(200);
+      assert.equal((await dispatchTask(pool, { taskId: z.id, config: zero, fetchImpl: fz })).reason, "fire_budget_exhausted");
+      await fires(0, fz);
+    });
+
     await t.test("fallbacks: no ChatGPT trigger; unconfigured Claude re-armed once configured", async () => {
       await fresh();
       const f = fakeFetch(200);
