@@ -4,6 +4,7 @@ import pg from "pg";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 
 const app = express();
 app.use(express.json({ limit: "100kb" }));
@@ -265,12 +266,26 @@ app.use("/mcp", authorizeMcp);
 
 const transports = Object.create(null);
 
+// Sessions live only in memory and are lost on every restart (deploy, free-tier
+// spin-down). Per the MCP Streamable HTTP spec an unknown Mcp-Session-Id must be
+// answered with 404 so the client starts a new session; without a session only
+// an initialize request may create a transport.
+function rejectSession(res, status, message) {
+  res.status(status).json({ jsonrpc: "2.0", error: { code: status === 404 ? -32001 : -32000, message }, id: null });
+}
+
 app.post("/mcp", async (req, res) => {
   try {
     const sessionId = req.headers["mcp-session-id"];
     let transport;
     if (sessionId && transports[sessionId]) {
       transport = transports[sessionId];
+    } else if (sessionId) {
+      rejectSession(res, 404, "Session not found");
+      return;
+    } else if (!isInitializeRequest(req.body)) {
+      rejectSession(res, 400, "Bad Request: no session; send initialize first");
+      return;
     } else {
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
@@ -300,9 +315,13 @@ app.post("/mcp", async (req, res) => {
 
 app.get("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"];
-  const transport = sessionId ? transports[sessionId] : undefined;
+  if (!sessionId) {
+    rejectSession(res, 400, "Bad Request: missing MCP session ID");
+    return;
+  }
+  const transport = transports[sessionId];
   if (!transport) {
-    res.status(400).send("Invalid or missing MCP session ID");
+    rejectSession(res, 404, "Session not found");
     return;
   }
   await transport.handleRequest(req, res);
@@ -310,9 +329,13 @@ app.get("/mcp", async (req, res) => {
 
 app.delete("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"];
-  const transport = sessionId ? transports[sessionId] : undefined;
+  if (!sessionId) {
+    rejectSession(res, 400, "Bad Request: missing MCP session ID");
+    return;
+  }
+  const transport = transports[sessionId];
   if (!transport) {
-    res.status(400).send("Invalid or missing MCP session ID");
+    rejectSession(res, 404, "Session not found");
     return;
   }
   await transport.handleRequest(req, res);
