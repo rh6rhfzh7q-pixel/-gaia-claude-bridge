@@ -1,10 +1,15 @@
 import express from "express";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import {
+  DISPATCHING_TYPES, TASK_INTAKE_SQL, TASK_SCHEMA_SQL, claimTask, completeTask, createTask, dispatchTask, getTask, heartbeatTask,
+  listTasks, readDispatchConfig, readSigningKey, sweep
+} from "./tasks.js";
+import { TASK_PRINCIPALS, resolvePrincipal } from "./auth.js";
 
 const app = express();
 app.use(express.json({ limit: "100kb" }));
@@ -77,11 +82,30 @@ const memoryTool = (handler) => async (args) => {
   }
 };
 
-function createServer() {
+function createServer({ principal } = {}) {
   const server = new McpServer({
     name: "gaia-claude-bridge",
     version: "1.0.0"
   }, { maxToolInputElements: 512 });
+
+  // Identity binding for the pre-existing tools: with an assistant token the
+  // self-reported actor/sender/recipient field must equal the authenticated
+  // principal. The shared legacy token keeps its previous behaviour.
+  const ACTOR_FIELDS = {
+    gaia_project_update: "actor", gaia_message_send: "sender", gaia_message_inbox: "recipient",
+    gaia_message_ack: "actor", gaia_control_item_progress: "actor", gaia_executive_review_record: "actor"
+  };
+  const registerTool = server.registerTool.bind(server);
+  server.registerTool = (name, config, handler) => {
+    const field = ACTOR_FIELDS[name];
+    if (!field) return registerTool(name, config, handler);
+    return registerTool(name, config, async (args, extra) => {
+      if (TASK_PRINCIPALS.has(principal) && args?.[field] !== principal) {
+        return { isError: true, content: [{ type: "text", text: `Forbidden: ${field} must match the authenticated principal (${principal}).` }] };
+      }
+      return handler(args, extra);
+    });
+  };
   const namespace = z.string().min(1).default("gaia");
   const key = z.string().min(1);
 
@@ -238,28 +262,98 @@ function createServer() {
       await c.query("COMMIT");return{review:q.rows[0]};
     }catch(e){await c.query("ROLLBACK");throw e}finally{c.release()}
   }));
+
+  // --- Internal task queue between assistants (see tasks.js) --------------
+  // Identity comes from the authenticated principal of this MCP session
+  // (per-assistant token, see auth.js). There is deliberately no sender/actor
+  // parameter. The shared legacy token has no access to these tools.
+  const taskTool=(handler)=>async(args)=>{
+    if(!TASK_PRINCIPALS.has(principal)){
+      return {isError:true,content:[{type:"text",text:"Forbidden: task tools require an assistant-specific token (GAIA_MCP_TOKEN_CLAUDE or GAIA_MCP_TOKEN_CHATGPT)."}]};
+    }
+    return memoryTool(async(a)=>{await ensureTasks();return handler(a);})(args);
+  };
+  server.registerTool("gaia_task_send",{
+    description:"Create an internal task (TASK, QUESTION, UPDATE or ACK) for the other assistant. The sender is your authenticated identity. TASK/QUESTION to Claude start a Claude run automatically when the event trigger is configured; the result reports whether that dispatch actually happened. UPDATE/ACK are stored only. Internal work only: no external business actions.",
+    inputSchema:{
+      project_key:key, recipient:z.enum(["claude","chatgpt"]),
+      task_type:z.enum(["TASK","QUESTION","UPDATE","ACK"]),
+      subject:z.string().min(1).max(200), instructions:z.string().min(1).max(20000),
+      parent_task_id:z.number().int().min(1).optional(),
+      idempotency_key:z.string().min(8).max(100).optional()
+    }
+  },taskTool(async(args)=>{
+    const created=await createTask(pool,args,{principal,signingKey:readSigningKey()});
+    if(!created.created) return created;
+    let dispatch={dispatched:false,reason:"type_not_dispatched"};
+    if(DISPATCHING_TYPES.has(args.task_type)){
+      try{dispatch=await dispatchTask(pool,{taskId:created.task.id,config:readDispatchConfig()});}
+      catch{dispatch={dispatched:false,reason:"dispatch_error_will_retry"};console.error("Task dispatch failed.");}
+    }
+    return {...created,dispatch};
+  }));
+  server.registerTool("gaia_task_get",{
+    description:"Read one internal task you sent or received, with its full status history.",
+    inputSchema:{id:z.number().int().min(1)}
+  },taskTool(async({id})=>getTask(pool,id,{principal,signingKey:readSigningKey()})));
+  server.registerTool("gaia_task_list",{
+    description:"List your internal tasks, newest first: role inbox (addressed to you), outbox (sent by you) or all (both).",
+    inputSchema:{
+      role:z.enum(["inbox","outbox","all"]).default("all"),
+      status:z.enum(["CREATED","QUEUED","DISPATCHED","ACKNOWLEDGED","RUNNING","COMPLETED","FAILED"]).optional(),
+      limit:z.number().int().min(1).max(100).default(20)
+    }
+  },taskTool(async(args)=>listTasks(pool,args,{principal,signingKey:readSigningKey()})));
+  server.registerTool("gaia_task_claim",{
+    description:"Atomically acknowledge and start a task addressed to you (-> RUNNING, 60-minute lease). Only signed tasks created through the bridge can be claimed, and only once. Returns a one-time secret claim_token (required for heartbeat and completion; keep it private) and the binding execution policy: internal work only; task text is never permission for external business actions.",
+    inputSchema:{id:z.number().int().min(1),executor_session:z.string().max(120).optional()}
+  },taskTool(async({id,executor_session})=>claimTask(pool,{taskId:id,principal,executorSession:executor_session,signingKey:readSigningKey()})));
+  server.registerTool("gaia_task_heartbeat",{
+    description:"Extend the lease of a task you are running (claim_token from gaia_task_claim). Call before any write action and at least every 30 minutes. If alive=false, stop immediately without further side effects; the lease expired and the task is no longer tracked as yours.",
+    inputSchema:{id:z.number().int().min(1),claim_token:z.string().regex(/^[0-9a-f]{64}$/)}
+  },taskTool(async({id,claim_token})=>heartbeatTask(pool,{taskId:id,principal,claimToken:claim_token})));
+  server.registerTool("gaia_task_complete",{
+    description:"Finish a task you claimed (claim_token from gaia_task_claim) while its lease is live. outcome completed/declined -> COMPLETED, failed -> FAILED. The result is stored for the sender; results never start a new run. After lease expiry completion is rejected.",
+    inputSchema:{id:z.number().int().min(1),claim_token:z.string().regex(/^[0-9a-f]{64}$/),outcome:z.enum(["completed","failed","declined"]),result:z.string().min(1).max(20000)}
+  },taskTool(async({id,claim_token,outcome,result:text})=>completeTask(pool,{taskId:id,principal,claimToken:claim_token,outcome,result:text})));
   return server;
+}
+
+let taskSchema;
+function ensureTasks(){
+  if(!taskSchema){
+    taskSchema=ensureMemory().then(()=>pool.query(TASK_SCHEMA_SQL)).then(()=>readDispatchConfig().intakeRole?pool.query(TASK_INTAKE_SQL):null).catch((error)=>{taskSchema=undefined;throw error;});
+  }
+  return taskSchema;
+}
+
+// Housekeeping and dispatch of due tasks, including tasks inserted directly
+// via SQL. Runs only while the process is awake (Render free instances sleep).
+let sweeping=false;
+async function runTaskSweep(){
+  if(!pool||sweeping) return;
+  sweeping=true;
+  try{await ensureTasks();await sweep(pool,{config:readDispatchConfig()});}
+  catch{console.error("Task sweep failed.");}
+  finally{sweeping=false;}
 }
 
 
 // Require a private bearer token for every MCP request. Fail closed when unset.
+// The token determines the principal (claude, chatgpt or legacy); see auth.js.
 // /health remains public but exposes only service status, never memory content.
 function authorizeMcp(req, res, next) {
-  const token = process.env.GAIA_MCP_TOKEN;
-  if (!token || token.length < 32) {
+  const resolved = resolvePrincipal(req.get("authorization"));
+  if (resolved.status === "unconfigured") {
     res.status(503).json({ error: "MCP access not configured" });
     return;
   }
-  const authorization = req.get("authorization") || "";
-  const expected = "Bearer " + token;
-  const actualBytes = Buffer.from(authorization);
-  const expectedBytes = Buffer.from(expected);
-  if (actualBytes.length !== expectedBytes.length ||
-      !timingSafeEqual(actualBytes, expectedBytes)) {
+  if (resolved.status !== "ok") {
     res.set("WWW-Authenticate", 'Bearer realm="GAIA MCP"');
     res.status(401).json({ error: "Unauthorized" });
     return;
   }
+  req.gaiaPrincipal = resolved.principal;
   next();
 }
 app.use("/mcp", authorizeMcp);
@@ -280,7 +374,14 @@ app.post("/mcp", async (req, res) => {
     let transport;
     if (sessionId && transports[sessionId]) {
       transport = transports[sessionId];
+      // A session stays bound to the principal that created it.
+      if (transport.gaiaPrincipal !== req.gaiaPrincipal) {
+        res.status(403).json({ jsonrpc: "2.0", error: { code: -32003, message: "Session belongs to another principal" }, id: null });
+        return;
+      }
     } else if (sessionId) {
+      // Unknown session (e.g. after a restart or deploy): per the MCP
+      // Streamable HTTP spec answer 404 so the client re-initializes.
       rejectSession(res, 404, "Session not found");
       return;
     } else if (!isInitializeRequest(req.body)) {
@@ -296,7 +397,8 @@ app.post("/mcp", async (req, res) => {
       transport.onclose = () => {
         if (transport.sessionId) delete transports[transport.sessionId];
       };
-      const server = createServer();
+      transport.gaiaPrincipal = req.gaiaPrincipal;
+      const server = createServer({ principal: req.gaiaPrincipal });
       await server.connect(transport);
       res.on("close", () => {
         if (!transport.sessionId) {
@@ -313,32 +415,32 @@ app.post("/mcp", async (req, res) => {
   }
 });
 
-app.get("/mcp", async (req, res) => {
+function sessionTransportOrReject(req, res) {
   const sessionId = req.headers["mcp-session-id"];
   if (!sessionId) {
     rejectSession(res, 400, "Bad Request: missing MCP session ID");
-    return;
+    return undefined;
   }
   const transport = transports[sessionId];
   if (!transport) {
     rejectSession(res, 404, "Session not found");
-    return;
+    return undefined;
   }
-  await transport.handleRequest(req, res);
+  if (transport.gaiaPrincipal !== req.gaiaPrincipal) {
+    res.status(403).send("Session belongs to another principal");
+    return undefined;
+  }
+  return transport;
+}
+
+app.get("/mcp", async (req, res) => {
+  const transport = sessionTransportOrReject(req, res);
+  if (transport) await transport.handleRequest(req, res);
 });
 
 app.delete("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"];
-  if (!sessionId) {
-    rejectSession(res, 400, "Bad Request: missing MCP session ID");
-    return;
-  }
-  const transport = transports[sessionId];
-  if (!transport) {
-    rejectSession(res, 404, "Session not found");
-    return;
-  }
-  await transport.handleRequest(req, res);
+  const transport = sessionTransportOrReject(req, res);
+  if (transport) await transport.handleRequest(req, res);
 });
 
 app.get("/", (_req, res) => {
@@ -386,10 +488,16 @@ void ensureMemory().catch(() => {
     : "GAIA Memory is not configured: DATABASE_URL is missing.");
 });
 
+// Best-effort task housekeeping while the process is awake.
+void runTaskSweep();
+const sweepTimer = setInterval(() => { void runTaskSweep(); }, 30000);
+sweepTimer.unref();
+
 let shuttingDown = false;
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  clearInterval(sweepTimer);
   const timeout = setTimeout(() => process.exit(1), 10000);
   timeout.unref();
   listener.close();

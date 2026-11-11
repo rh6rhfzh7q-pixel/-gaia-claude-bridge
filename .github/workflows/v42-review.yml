@@ -1,0 +1,76 @@
+name: G.A.I.A. V4.2 isolated review
+on:
+  push:
+    branches:
+      - feature/realtime-tasks-review
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  static-and-unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Dependency security audit
+        run: npm audit --audit-level=moderate
+      - name: Syntax check
+        run: |
+          find . -path './node_modules' -prune -o -name '*.js' -type f -print0 | xargs -0 -r -n1 node --check
+      - name: Unit tests (no production database)
+        env:
+          DATABASE_URL: ''
+          GAIA_TEST_DATABASE_URL: ''
+        run: npm test
+
+  isolated-postgresql-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gaia_ci
+          POSTGRES_PASSWORD: gaia_ci_disposable_only
+          POSTGRES_DB: gaia_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gaia_ci -d gaia_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: ''
+      GAIA_TEST_DB_CONFIRM: disposable-local-database
+      GAIA_TEST_DATABASE_URL: postgresql://gaia_ci:gaia_ci_disposable_only@127.0.0.1:5432/gaia_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Mark isolated test database as disposable
+        run: |
+          node --input-type=module <<'NODE'
+          import pg from 'pg';
+          const c = new pg.Client({ connectionString: process.env.GAIA_TEST_DATABASE_URL });
+          await c.connect();
+          try {
+            await c.query("COMMENT ON DATABASE gaia_test IS 'gaia-disposable-test-database'");
+          } finally {
+            await c.end();
+          }
+          NODE
+      - name: Run isolated PostgreSQL integration suite
+        run: node --test test/tasks.pg.test.js
