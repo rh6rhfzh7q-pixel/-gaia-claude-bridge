@@ -360,6 +360,14 @@ app.use("/mcp", authorizeMcp);
 
 const transports = Object.create(null);
 
+// Sessions live only in memory and are lost on every restart (deploy, free-tier
+// spin-down). Per the MCP Streamable HTTP spec an unknown Mcp-Session-Id must be
+// answered with 404 so the client starts a new session; without a session only
+// an initialize request may create a transport.
+function rejectSession(res, status, message) {
+  res.status(status).json({ jsonrpc: "2.0", error: { code: status === 404 ? -32001 : -32000, message }, id: null });
+}
+
 app.post("/mcp", async (req, res) => {
   try {
     const sessionId = req.headers["mcp-session-id"];
@@ -374,10 +382,10 @@ app.post("/mcp", async (req, res) => {
     } else if (sessionId) {
       // Unknown session (e.g. after a restart or deploy): per the MCP
       // Streamable HTTP spec answer 404 so the client re-initializes.
-      res.status(404).json({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null });
+      rejectSession(res, 404, "Session not found");
       return;
     } else if (!isInitializeRequest(req.body)) {
-      res.status(400).json({ jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: initialize first" }, id: null });
+      rejectSession(res, 400, "Bad Request: no session; send initialize first");
       return;
     } else {
       transport = new StreamableHTTPServerTransport({
@@ -410,12 +418,12 @@ app.post("/mcp", async (req, res) => {
 function sessionTransportOrReject(req, res) {
   const sessionId = req.headers["mcp-session-id"];
   if (!sessionId) {
-    res.status(400).send("Missing MCP session ID");
+    rejectSession(res, 400, "Bad Request: missing MCP session ID");
     return undefined;
   }
   const transport = transports[sessionId];
   if (!transport) {
-    res.status(404).send("MCP session not found");
+    rejectSession(res, 404, "Session not found");
     return undefined;
   }
   if (transport.gaiaPrincipal !== req.gaiaPrincipal) {
